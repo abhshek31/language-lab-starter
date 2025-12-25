@@ -3,14 +3,17 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "parcel public/index.html --port 3000",
-    "build": "parcel build public/index.html --public-url ./"
+    "dev": "vite --host",
+    "build": "vite build",
+    "preview": "vite preview --host"
   },
   "dependencies": {
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "parcel": "^2.9.3"
+    "@vitejs/plugin-react": "^4.2.0",
+    "vite": "^5.0.0"
   }
 }
+
