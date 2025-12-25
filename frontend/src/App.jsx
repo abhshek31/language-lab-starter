@@ -1,24 +1,21 @@
 import React, { useEffect, useState } from 'react';
+import Recorder from './Recorder';
 
 const API_BASE = `http://${window.location.hostname}:4000`;
 
 export default function App() {
   const [user, setUser] = useState(null);
-  const [error, setError] = useState('');
+  const [recordings, setRecordings] = useState([]);
   const [ws, setWs] = useState(null);
 
-  // connect websocket once
   useEffect(() => {
     const socket = new WebSocket(`ws://${window.location.hostname}:4000`);
-
     socket.onopen = () => console.log('WS connected');
-    socket.onerror = (e) => console.error('WS error', e);
-
     setWs(socket);
     return () => socket.close();
   }, []);
 
-  async function handleLogin(e) {
+  async function login(e) {
     e.preventDefault();
     const form = new FormData(e.target);
 
@@ -27,33 +24,42 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         username: form.get('username'),
-        password: form.get('password'),
-      }),
+        password: form.get('password')
+      })
     });
 
     const data = await res.json();
-    if (!data.token) {
-      setError('Login failed');
-    } else {
-      setUser(data.user);
-    }
+    if (data.user) setUser(data.user);
+  }
+
+  async function uploadRecording(blob) {
+    const fd = new FormData();
+    fd.append('file', blob, `rec-${Date.now()}.webm`);
+
+    await fetch(`${API_BASE}/api/recordings/upload`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer dummy` },
+      body: fd
+    });
+
+    alert('Recording uploaded');
+  }
+
+  async function loadRecordings() {
+    const res = await fetch(`${API_BASE}/api/recordings`, {
+      headers: { Authorization: `Bearer dummy` }
+    });
+    setRecordings(await res.json());
   }
 
   if (!user) {
     return (
-      <div style={styles.center}>
-        <form onSubmit={handleLogin} style={styles.card}>
-          <h2>Language Lab</h2>
-          <input name="username" placeholder="username" />
-          <input name="password" type="password" placeholder="password" />
-          <button type="submit">Login</button>
-          {error && <p style={{ color: 'red' }}>{error}</p>}
-          <p style={{ fontSize: 12 }}>
-            teacher / teacherpass<br />
-            student / studentpass
-          </p>
-        </form>
-      </div>
+      <form onSubmit={login} style={{ padding: 30 }}>
+        <h2>Login</h2>
+        <input name="username" placeholder="username" /><br />
+        <input name="password" placeholder="password" type="password" /><br />
+        <button>Login</button>
+      </form>
     );
   }
 
@@ -62,41 +68,27 @@ export default function App() {
       <h2>Welcome {user.username}</h2>
       <p>Role: {user.role}</p>
 
-      {user.role === 'teacher' ? (
-        <button
-          onClick={() =>
-            ws?.send(
-              JSON.stringify({
-                type: 'broadcast',
-                url: `${API_BASE}/uploads/sample.mp3`,
-              })
-            )
-          }
-        >
-          Broadcast Sample Audio
-        </button>
-      ) : (
-        <p>Waiting for teacher broadcast…</p>
+      {user.role === 'student' && (
+        <>
+          <h3>Record your voice</h3>
+          <Recorder onUpload={uploadRecording} />
+        </>
+      )}
+
+      {user.role === 'teacher' && (
+        <>
+          <h3>Student Recordings</h3>
+          <button onClick={loadRecordings}>Load</button>
+          <ul>
+            {recordings.map(r => (
+              <li key={r.name}>
+                {r.name}
+                <audio controls src={`${API_BASE}${r.url}`} />
+              </li>
+            ))}
+          </ul>
+        </>
       )}
     </div>
   );
 }
-
-const styles = {
-  center: {
-    height: '100vh',
-    display: 'flex',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  card: {
-    width: 300,
-    padding: 20,
-    border: '1px solid #ddd',
-    borderRadius: 8,
-    display: 'flex',
-    flexDirection: 'column',
-    gap: 10,
-  },
-};
-
