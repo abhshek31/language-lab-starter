@@ -1,153 +1,212 @@
-// backend/index.js
 const express = require('express');
-const http = require('http');
-const path = require('path');
-const multer = require('multer');
-const fs = require('fs');
-const jwt = require('jsonwebtoken');
-const WebSocket = require('ws');
 const cors = require('cors');
+const http = require('http');
+const WebSocket = require('ws');
+const multer = require('multer');
+const path = require('path');
+const fs = require('fs');
 
-require('dotenv').config();
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
+const pool = require('./db');
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocket.Server({ server });
 
-app.use(express.json());
-app.use(cors());
+const JWT_SECRET = 'language-lab-secret';
 
-// storage for uploads
+// ----------------------------------
+app.use(cors());
+app.use(express.json());
+
+// ----------------------------------
+// Uploads
 const UPLOAD_DIR = path.join(__dirname, 'uploads');
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+app.use('/uploads', express.static(UPLOAD_DIR));
 
-// multer config
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const t = Date.now();
-    cb(null, `${t}-${file.originalname.replace(/\s+/g,'_')}`);
-  }
-});
-const upload = multer({ storage });
-
-// demo users (hardcoded for starter)
-const USERS = [
-  { id: 'teacher1', username: 'teacher', password: 'teacherpass', role: 'teacher' },
-  { id: 'student1', username: 'student', password: 'studentpass', role: 'student' }
-];
-
-const JWT_SECRET = process.env.JWT_SECRET || 'replace-me-very-secret';
-
-// simple auth
-app.post('/api/login', (req, res) => {
-  const { username, password } = req.body;
-  const user = USERS.find(u => u.username === username && u.password === password);
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
-  const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, JWT_SECRET, { expiresIn: '8h' });
-  res.json({ token, user: { id: user.id, username: user.username, role: user.role } });
-});
-
-// middleware to protect endpoints
-function authMiddleware(req, res, next) {
+// ----------------------------------
+// AUTH MIDDLEWARE
+function auth(req, res, next) {
   const h = req.headers.authorization;
-  if (!h) return res.status(401).json({ error: 'Missing auth' });
-  const parts = h.split(' ');
-  if (parts.length !== 2) return res.status(401).json({ error: 'Invalid auth' });
-  const token = parts[1];
+  if (!h) return res.sendStatus(401);
+
   try {
+    const token = h.split(' ')[1];
     req.user = jwt.verify(token, JWT_SECRET);
     next();
-  } catch (e) {
-    return res.status(401).json({ error: 'Invalid token' });
+  } catch {
+    res.sendStatus(401);
   }
 }
 
-// list uploaded lesson media (teacher)
-app.get('/api/lessons', authMiddleware, (req, res) => {
-  // list all audio files in uploads (very simple)
-  const files = fs.readdirSync(UPLOAD_DIR).map(f => ({
-    name: f,
-    url: `/uploads/${f}`,
-    createdAt: fs.statSync(path.join(UPLOAD_DIR,f)).ctime
+function adminOnly(req, res, next) {
+  if (req.user.role !== 'admin') return res.sendStatus(403);
+  next();
+}
+
+// ----------------------------------
+// LOGIN (approved users only)
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+
+  const [rows] = await pool.query(
+    'SELECT * FROM users WHERE username = ?',
+    [username]
+  );
+
+  if (!rows.length) return res.status(401).json({ error: 'Invalid credentials' });
+
+  const user = rows[0];
+  if (user.status !== 'approved')
+    return res.status(403).json({ error: 'Account not approved' });
+
+  const ok = await bcrypt.compare(password, user.password_hash);
+  if (!ok) return res.status(401).json({ error: 'Invalid credentials' });
+
+  const token = jwt.sign(
+    { id: user.id, role: user.role },
+    JWT_SECRET,
+    { expiresIn: '8h' }
+  );
+
+  res.json({
+    token,
+    user: {
+      id: user.id,
+      username: user.username,
+      role: user.role,
+      full_name: user.full_name,
+      class_name: user.class_name,
+      profile_pic: user.profile_pic,
+    },
+  });
+});
+
+// ----------------------------------
+// REGISTER
+app.post('/api/register', async (req, res) => {
+  const { username, password, role, full_name, class_name } = req.body;
+  const hash = await bcrypt.hash(password, 10);
+
+  try {
+    const [r] = await pool.query(
+      `INSERT INTO users
+       (username, password_hash, role, full_name, class_name, status)
+       VALUES (?, ?, ?, ?, ?, 'pending')`,
+      [username, hash, role, full_name, class_name]
+    );
+
+    await pool.query(
+      'INSERT INTO user_status (user_id, is_online) VALUES (?, FALSE)',
+      [r.insertId]
+    );
+
+    res.json({ message: 'Registration submitted for approval' });
+  } catch {
+    res.status(400).json({ error: 'Username already exists' });
+  }
+});
+
+// ----------------------------------
+// ADMIN
+app.get('/api/admin/pending-users', auth, adminOnly, async (req, res) => {
+  const [rows] = await pool.query(
+    `SELECT id, full_name, role, class_name FROM users WHERE status='pending'`
+  );
+  res.json(rows);
+});
+
+app.post('/api/admin/approve/:id', auth, adminOnly, async (req, res) => {
+  await pool.query(
+    `UPDATE users SET status='approved', approved_at=NOW() WHERE id=?`,
+    [req.params.id]
+  );
+  res.json({ message: 'Approved' });
+});
+
+app.post('/api/admin/reject/:id', auth, adminOnly, async (req, res) => {
+  await pool.query(
+    `UPDATE users SET status='rejected' WHERE id=?`,
+    [req.params.id]
+  );
+  res.json({ message: 'Rejected' });
+});
+
+// ----------------------------------
+// TEACHER – STUDENT LIST
+app.get('/api/teacher/students', auth, async (req, res) => {
+  if (req.user.role !== 'teacher') return res.sendStatus(403);
+
+  const [rows] = await pool.query(`
+    SELECT u.id, u.full_name, u.class_name, u.profile_pic, s.is_online
+    FROM users u
+    JOIN user_status s ON u.id = s.user_id
+    WHERE u.role='student' AND u.status='approved'
+  `);
+
+  res.json(rows);
+});
+
+// ----------------------------------
+// RECORDINGS
+const upload = multer({ dest: UPLOAD_DIR });
+
+app.post('/api/recordings/upload', auth, upload.single('file'), (req, res) => {
+  res.json({ message: 'Uploaded' });
+});
+
+app.get('/api/recordings', auth, (req, res) => {
+  const files = fs.readdirSync(UPLOAD_DIR).map((n) => ({
+    name: n,
+    url: `/uploads/${n}`,
   }));
   res.json(files);
 });
 
-// upload lesson (teacher)
-app.post('/api/lessons/upload', authMiddleware, upload.single('file'), (req, res) => {
-  if (req.user.role !== 'teacher') return res.status(403).json({ error: 'Only teacher allowed' });
-  const file = req.file;
-  res.json({ success: true, file: { name: file.filename, url: `/uploads/${file.filename}` } });
-});
+// ----------------------------------
+// WEBSOCKET PRESENCE
+const clients = new Map();
 
-// student uploads recording
-app.post('/api/recordings/upload', authMiddleware, upload.single('file'), (req, res) => {
-  if (req.user.role !== 'student') return res.status(403).json({ error: 'Only students upload recordings' });
-  const file = req.file;
-  // For a real app you'd persist metadata in DB. Here we keep simple.
-  res.json({ success: true, file: { name: file.filename, url: `/uploads/${file.filename}` } });
-});
+wss.on('connection', (ws) => {
+  ws.on('message', async (msg) => {
+    const data = JSON.parse(msg.toString());
+    if (data.type === 'auth') {
+      const user = jwt.verify(data.token, JWT_SECRET);
+      ws.userId = user.id;
+      ws.role = user.role;
+      clients.set(user.id, ws);
 
-// list all recordings (teacher)
-app.get('/api/recordings', authMiddleware, (req, res) => {
-  if (req.user.role !== 'teacher') return res.status(403).json({ error: 'Only teacher allowed' });
-  // naive: list all files but mark those that look like student recordings (filename contains original name)
-  const files = fs.readdirSync(UPLOAD_DIR).map(f => ({
-    name: f,
-    url: `/uploads/${f}`,
-    createdAt: fs.statSync(path.join(UPLOAD_DIR,f)).ctime
-  }));
-  res.json(files);
-});
+      await pool.query(
+        'UPDATE user_status SET is_online=TRUE WHERE user_id=?',
+        [user.id]
+      );
 
-// static serving of uploads
-app.use('/uploads', express.static(UPLOAD_DIR));
-
-// ----------------- WebSocket for real-time events -----------------
-const clients = new Set();
-wss.on('connection', (ws, req) => {
-  ws.isAlive = true;
-  clients.add(ws);
-
-  ws.on('pong', () => { ws.isAlive = true; });
-
-  ws.on('message', message => {
-    try {
-      const msg = JSON.parse(message);
-      // client can send identity after connecting
-      if (msg.type === 'hello') {
-        ws.identity = msg.identity || 'guest';
-        ws.role = msg.role || 'guest';
-      }
-      // teacher -> server: broadcast a lesson to everyone
-      if (msg.type === 'broadcast' && msg.url) {
-        // forward to all connected clients (including students)
-        const payload = JSON.stringify({ type: 'broadcast', url: msg.url, from: ws.identity || 'teacher' });
-        clients.forEach(c => {
-          if (c.readyState === WebSocket.OPEN) c.send(payload);
-        });
-      }
-    } catch (e) {
-      console.error('ws parse error', e);
+      broadcast(user.id, true);
     }
   });
 
-  ws.on('close', () => clients.delete(ws));
-});
-
-// ping/pong to keep connection alive
-setInterval(() => {
-  clients.forEach((c) => {
-    if (!c.isAlive) {
-      c.terminate();
-      clients.delete(c);
-    } else {
-      c.isAlive = false;
-      c.ping();
+  ws.on('close', async () => {
+    if (ws.userId) {
+      clients.delete(ws.userId);
+      await pool.query(
+        'UPDATE user_status SET is_online=FALSE,last_seen=NOW() WHERE user_id=?',
+        [ws.userId]
+      );
+      broadcast(ws.userId, false);
     }
   });
-}, 30000);
+});
 
-const PORT = process.env.PORT || 4000;
-server.listen(PORT, () => console.log(`Backend listening on ${PORT}`));
+function broadcast(userId, online) {
+  const msg = JSON.stringify({ type: 'presence', userId, online });
+  for (const ws of clients.values()) {
+    if (ws.role === 'teacher') ws.send(msg);
+  }
+}
+
+// ----------------------------------
+server.listen(4000, () => {
+  console.log('Backend running on port 4000');
+});
